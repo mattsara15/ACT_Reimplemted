@@ -27,7 +27,7 @@ def evaluate_model(model, env_name, num_episodes=10):
         while not done:
             # Assuming the model takes state as input and outputs actions
             state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(model._device)
-            action = model(state_tensor).cpu().detach().numpy()
+            action = model.select_action(state_tensor).cpu().detach().numpy()
             print(f"Action shape {action.shape}")
             state, reward, done, info = env.step(action)
             env.render()

@@ -1,5 +1,8 @@
 # model/act.py
 # type: ignore[all]
+
+import os
+
 import torch
 import math
 import torch.nn as nn
@@ -81,19 +84,18 @@ class ACTModel(nn.Module):
             d_model=self._d_model,
         ).to(self._device)
         self.z_projector = nn.Linear(32, self._d_model).to(self._device)
-        
-        
+
         self._vision = VisionBlock(
             self._input_image_size, self._d_model, self._device
         ).to(self._device)
-        
+
         self._state_projector = nn.Linear(self._action_space, self._d_model).to(
             self._device
         )
 
-        self.pos_encoder = PositionalEncoding(self._d_model, max_len=self._K, dropout=0.1).to(
-            self._device
-        )
+        self.pos_encoder = PositionalEncoding(
+            self._d_model, max_len=self._K, dropout=0.1
+        ).to(self._device)
         self.action_queries = nn.Parameter(torch.randn(self._K, 1, self._d_model)).to(
             self._device
         )
@@ -135,22 +137,47 @@ class ACTModel(nn.Module):
             lr=0.0000625,
         )
 
+    def save_checkpoint(self, path: str) -> bool:
+        """Save model and optimizer state to `path`.
+
+        Returns True on success, False on failure.
+        """
+        parent = os.path.dirname(path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+
+        checkpoint = {
+            "model_state": self.state_dict(),
+        }
+        torch.save(checkpoint, path)
+        return True
+
+    def load_from_checkpoint(self, path: str) -> bool:
+        """Load model and optimizer state from `path`.
+
+        Returns True on success, False on failure.
+        """
+
+        # Load checkpoint with correct device mapping
+        checkpoint = torch.load(path, map_location=self._device)
+
+        # Load model weights
+        if "model_state" in checkpoint:
+            self.load_state_dict(checkpoint["model_state"])
+        return True
+
     def select_action(
-        visual_features: torch.Tensor, state: torch.Tensor, num_samples: int = 1
+        self, visual_features: torch.Tensor, state: torch.Tensor, num_samples: int = 1
     ) -> torch.Tensor:
         with torch.no_grad():
             if num_samples == 1:
-                actions, _, _ = self.forward(
-                    visual_features, state, actions=None, sample_latent=True
-                )
-                return actions
+                actions = self.forward(visual_features, state, latent=None)
+                return actions.squeeze(0)
             else:
                 # Sample multiple times and average
                 action_samples = []
                 for _ in range(num_samples):
-                    actions, _, _ = self.forward(
-                        visual_features, state, actions=None, sample_latent=True
-                    )
+                    actions = self.forward(visual_features, state, latent=None)
                     action_samples.append(actions)
 
                 return torch.stack(action_samples).mean(dim=0)
@@ -161,7 +188,7 @@ class ACTModel(nn.Module):
         B, _, _, _ = image.shape
 
         z = latent
-        if not latent:
+        if latent == None:
             # provide empty encoder at inference time
             z = torch.zeros(B, 32, device=self._device)
 
