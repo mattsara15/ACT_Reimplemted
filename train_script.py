@@ -1,6 +1,7 @@
 # type: ignore[all]
 
 import argparse
+import os
 import torch
 import time
 
@@ -39,7 +40,7 @@ def parse_args():
         "--epochs",
         "-e",
         type=int,
-        default=1,
+        default=30,
         help="Number of training epochs batches to run",
     )
     p.add_argument(
@@ -56,11 +57,20 @@ def parse_args():
         default=False,
         help="Convert observation.image to grayscale",
     )
+    p.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="checkpoints",
+        help="Directory to save model checkpoints",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Ensure checkpoint directory exists
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     logger = SummaryWriter(
         f"{args.log_dir}/{time.strftime('%d-%m-%Y_%H-%M-%S')}",
@@ -134,8 +144,22 @@ def main():
         # evaluate
         print(f"Completed epoch {epoch+1}/{args.epochs}")
         # include any evaluation logic here
-        print
 
+        # Save checkpoint periodically
+        checkpoint_path = os.path.join(
+            args.checkpoint_dir, f"checkpoint_epoch{epoch+1}_step{step_num}.pth"
+        )
+    
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "step": step_num,
+                "model_state_dict": model.state_dict(),
+            },
+            checkpoint_path,
+        )
+        print(f"Checkpoint saved at {checkpoint_path}")
+            
 
 if __name__ == "__main__":
     main()
