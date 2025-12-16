@@ -16,8 +16,9 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from torch.utils.tensorboard import SummaryWriter
 
 # local imports
-from dataset import ACTDataLoader
+from dataset import ACTDataLoader, ACTValDataLoader
 from model.act import ACTModel
+from model.temporal_ensemble_policy import TemporalEnsemblePolicy
 
 
 def parse_args():
@@ -75,17 +76,20 @@ def parse_args():
     return p.parse_args()
 
 
-def evaluate_model(model, env_name, render_eval: bool, num_episodes=10, max_steps=1000):
+def evaluate_model_in_gym(
+    model, env_name, render_eval: bool, logger, num_episodes=10, max_steps=1000
+):
     """Evaluate the model in the specified gym environment."""
     env = None
     print(f"Making eval with render mode: {render_eval}")
     if render_eval:
-        
         env = gym.make(env_name, obs_type="pixels_agent_pos", render_mode="rgb_array")
     else:
         env = gym.make(env_name, obs_type="pixels_agent_pos")
     episode_steps = []
     episode_rewards = []
+    actions_x = []
+    actions_y = []
     for _ in range(num_episodes):
         observation, _ = env.reset(seed=42)
         done = False
@@ -104,25 +108,28 @@ def evaluate_model(model, env_name, render_eval: bool, num_episodes=10, max_step
             state = state.to(model._device, non_blocking=True)
             image = image.to(model._device, non_blocking=True)
 
-            # Add extra (empty) batch dimension, required to forward the policy
             state = state.unsqueeze(0)
             image = image.unsqueeze(0)
 
+            # TODO(mattsara) implement temporal ensemble policy
             action = model.select_action(image, state).cpu().detach().numpy()[0]
-            print(f"Action {action}")
-            if (action[0] > 0 and action[0] < 512) and (action[1] > 0 and action[1] < 512):
-                observation, reward, terminated, truncated, _ = env.step(action)    
-                # TODO(mattsara) implement a temporal ensemble
-            else:
-                print("Act fallback")
-                observation, reward, terminated, truncated, _ = env.step(np.array([0,0]))
+
+            if np.isnan(action[0]) or np.isnan(action[1]):
+                steps_count += 1
+                continue
+            actions_x.append(action[0])
+            actions_y.append(action[1])
+            observation, reward, terminated, truncated, _ = env.step(action)
+
             done = terminated or truncated
             env.render()
 
-            max_steps += 1
+            steps_count += 1
             rewards += reward
+
             if steps_count > max_steps:
                 break
+
         episode_rewards.append(rewards)
         episode_steps.append(steps_count)
 
@@ -131,6 +138,40 @@ def evaluate_model(model, env_name, render_eval: bool, num_episodes=10, max_step
     return {
         "mean_episode_reward": np.mean(episode_rewards),
         "mean_episode_steps": np.mean(episode_steps),
+        "action_histogram_x": np.asarray(actions_x),
+        "action_histogram_y": np.asarray(actions_y),
+    }
+
+
+def evaluate_model_on_demonstrations(
+    model,
+    val_dataloader,
+    args
+):
+    action_errors = []
+    for episode in val_dataloader:
+        with torch.no_grad():
+            policy = TemporalEnsemblePolicy(
+                model,
+                model._device,
+                chunk_size=args.k,
+                num_samples=1,
+                temporal_ensemble=True,
+            )
+            images = episode["image"].squeeze(0)
+            states = episode["state"].squeeze(0)
+            actions = episode["action"].squeeze(0)
+
+            for step in zip(images, actions, states):
+                image = step[0].unsqueeze(0)
+                state = step[1].unsqueeze(0)
+                action = step[2].unsqueeze(0)
+                predicted_action = policy.get_action(image, state)
+                action_error = np.linalg.norm(predicted_action - action.cpu().numpy(), ord=1)
+                action_errors.append(action_error)
+
+    return {
+        "mean_action_error": np.mean(action_errors)
     }
 
 
@@ -185,14 +226,25 @@ def main():
         use_grayscale=args.grayscale,
         dataset_name=args.dataset_name,
         device=args.device,
+        train_samples=195,
     )
     dataloader = torch.utils.data.DataLoader(
         act_dataset,
         num_workers=0,
         batch_size=args.batch_size,
         shuffle=True,
-        pin_memory=False,
-        drop_last=True,
+    )
+    act_val_dataset = ACTValDataLoader(
+        use_grayscale=args.grayscale,
+        dataset_name=args.dataset_name,
+        device=args.device,
+        test_samples=10,
+    )
+    val_dataloader = torch.utils.data.DataLoader(
+        act_val_dataset,
+        num_workers=0,
+        batch_size=1,
+        shuffle=False,
     )
 
     # Run training loop.
@@ -205,18 +257,27 @@ def main():
             action = batch["action"]
             result = model.train(image, state, action)
             for key, value in result.items():
-                logger.add_scalar(f"train/{key}", value, step_num)
+                if "histogram" in key:
+                    logger.add_histogram(f"train/{key}", value, step_num)
+                else:
+                    logger.add_scalar(f"train/{key}", value, step_num)
 
             step_num += 1
 
-        # include any evaluation logic here
-        eval_result = evaluate_model(model, "gym_pusht/PushT-v0", args.render_eval)
+        eval_result = evaluate_model_on_demonstrations(model, val_dataloader, args)
+
+        #eval_result = evaluate_model_in_gym(
+        #    model, "gym_pusht/PushT-v0", args.render_eval, logger
+        #)
         for key, value in eval_result.items():
-            logger.add_scalar(f"eval/{key}", value, step_num)
+            if "histogram" in key:
+                logger.add_histogram(f"eval/{key}", value, step_num)
+            else:
+                logger.add_scalar(f"eval/{key}", value, step_num)
 
         # evaluate
         print(
-            f"Completed epoch {epoch+1}/{args.epochs} with average score: {eval_result['mean_episode_reward']} and average steps {eval_result['mean_episode_steps']}"
+            f"Completed epoch {epoch+1}/{args.epochs} with eval error: {eval_result['mean_action_error']}"
         )
 
         # Save checkpoint periodically

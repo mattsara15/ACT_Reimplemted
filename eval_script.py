@@ -2,41 +2,69 @@
 
 import torch
 import gymnasium as gym
+from gymnasium.utils.save_video import save_video
 from model.act import ACTModel
+import numpy as np
+import gym_pusht  # Important: This registers the namespace
 
-def load_model(checkpoint_path, device):
+def load_model(checkpoint_path, device, env):
     """Load the ACTModel from a checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
     model = ACTModel(
-        input_image_size=checkpoint['input_image_size'],
-        input_state_size=checkpoint['input_state_size'],
-        action_space=checkpoint['action_space'],
-        K=checkpoint['K'],
+        input_image_size=[3,84,84],
+        input_state_size=2,
+        action_space=[2],
+        K=14,
         device=device
     )
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
+    model.load_from_checkpoint(checkpoint_path)
     return model
 
-def evaluate_model(model, env_name, num_episodes=10):
+def evaluate_model(env_name, num_episodes=1):
     """Evaluate the model in the specified gym environment."""
-    env = gym.make(env_name)
-    for episode in range(num_episodes):
-        state, _ = env.reset()
+    env = gym.make(env_name, obs_type="pixels_agent_pos", render_mode="rgb_array")
+    model = load_model(checkpoint_path, device, env)
+    for ep_num in range(num_episodes):
+        observation, _ = env.reset(seed=42)
         done = False
+        per_episode_reward = 0
+        out_frames = []
         while not done:
-            # Assuming the model takes state as input and outputs actions
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(model._device)
-            action = model.select_action(state_tensor).cpu().detach().numpy()
-            print(f"Action shape {action.shape}")
-            state, reward, done, info = env.step(action)
-            env.render()
+            state = torch.from_numpy(observation["agent_pos"])
+            image = torch.from_numpy(observation["pixels"])
+
+            # Convert to float32 with image from channel first in [0,255]
+            # to channel last in [0,1]
+            state = state.to(torch.float32)
+            image = image.to(torch.float32) / 255
+            image = image.permute(2, 0, 1)
+
+            state = state.to(model._device, non_blocking=True)
+            image = image.to(model._device, non_blocking=True)
+
+            state = state.unsqueeze(0)
+            image = image.unsqueeze(0)
+
+            # TODO(mattsara) implement temporal ensemble policy
+            action = model.select_action(image, state).cpu().detach().numpy()[0]
+            
+            if np.isnan(action[0]) or np.isnan(action[1]):
+                continue
+
+            print(f"selected action: {action}")
+
+            observation, reward, terminated, truncated, _ = env.step(action)    
+            
+            per_episode_reward += reward
+
+            done = terminated or truncated
+            out_frames.append(env.render())
+        save_video(out_frames, "videos", fps=20)
+        print(f"Episode # {ep_num} reward == {per_episode_reward}")
     env.close()
 
 if __name__ == "__main__":
-    checkpoint_path = "path/to/checkpoint.pth"  # Update with the actual path
-    env_name = "pusht-v0"  # Update with the actual environment name
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_path = "checkpoints/checkpoint_epoch20_step7160.pth"  # Update with the actual path
+    env_name = "gym_pusht/PushT-v0"  # Update with the actual environment name
+    device = torch.device("mps")
 
-    model = load_model(checkpoint_path, device)
-    evaluate_model(model, env_name)
+    evaluate_model(env_name)

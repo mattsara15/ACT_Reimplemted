@@ -5,6 +5,7 @@ import os
 
 import torch
 import math
+import numpy as np
 import torch.nn as nn
 
 from typing import List, Dict, Optional
@@ -61,6 +62,7 @@ class ACTModel(nn.Module):
         action_space: int,
         K: int,
         device: torch.device,
+        enhanced_debug: bool = True,
         d_model=512,
         num_encoder_layers=4,
         num_decoder_layers=7,
@@ -76,6 +78,8 @@ class ACTModel(nn.Module):
         self._d_model = d_model
 
         self.B = 10
+
+        self._enhanced_debug : bool = enhanced_debug
 
         # learnable components
         self.cvae_encoder = CVAE(
@@ -215,19 +219,42 @@ class ACTModel(nn.Module):
         return action_output
 
     def train(
-        self, image: torch.Tensor, state: torch.Tensor, action: torch.Tensor
+        self, image: torch.Tensor, state: torch.Tensor, actions: torch.Tensor
     ) -> Dict[str, float]:
         # run auto-encoder
-        z, z_mean, z_log = self.cvae_encoder.forward(state, action)
-
+        z, z_mean, z_log = self.cvae_encoder.forward(state, actions)
+        
         action_output = self.forward(image, state, z)
 
         # optimize
         self._optimizer.zero_grad()
-        recon_loss = torch.nn.functional.l1_loss(action_output, action)
+        recon_loss = torch.nn.functional.l1_loss(action_output, actions)
         total_kld = kl_divergence(z_mean, z_log)
         loss = recon_loss + self.B * total_kld
         loss.backward()
         self._optimizer.step()
 
-        return {"train_loss": loss, "recon_lss": recon_loss, "kl_loss": total_kld}
+        # Introspect the quality of action predictions
+        predicted_actions_x = []
+        predicted_actions_y = []
+        gt_actions_x = []
+        gt_actions_y = []
+        
+        if self._enhanced_debug:
+            for action in action_output:
+                predicted_actions_x.append(action[0][0].cpu().detach())
+                predicted_actions_y.append(action[0][1].cpu().detach())
+
+            for action in actions:
+                gt_actions_x.append(action[0][0].cpu().detach())
+                gt_actions_y.append(action[0][1].cpu().detach())
+
+        return {
+            "train_loss": loss,
+            "recon_lss": recon_loss,
+            "kl_loss": total_kld,
+            "predicted_action_histogram_x": np.asarray(predicted_actions_x),
+            "predicted_action_histogram_y": np.asarray(predicted_actions_y),
+            "gt_action_histogram_x": np.asarray(gt_actions_x),
+            "gt_action_histogram_y": np.asarray(gt_actions_y),
+        }
