@@ -62,7 +62,6 @@ class ACTModel(nn.Module):
         action_space: int,
         K: int,
         device: torch.device,
-        enhanced_debug: bool = True,
         d_model=512,
         num_encoder_layers=4,
         num_decoder_layers=7,
@@ -77,32 +76,24 @@ class ACTModel(nn.Module):
 
         self._d_model = d_model
 
-        self.B = 10
-
-        self._enhanced_debug : bool = enhanced_debug
-
         # learnable components
         self.cvae_encoder = CVAE(
             self._input_state_size,
             self._action_space,
             d_model=self._d_model,
-        ).to(self._device)
-        self.z_projector = nn.Linear(32, self._d_model).to(self._device)
+        )
+        self.z_projector = nn.Linear(32, self._d_model)
 
         self._vision = VisionBlock(
             self._input_image_size, self._d_model, self._device
-        ).to(self._device)
-
-        self._state_projector = nn.Linear(self._action_space, self._d_model).to(
-            self._device
         )
+
+        self._state_projector = nn.Linear(self._action_space, self._d_model)
 
         self.pos_encoder = PositionalEncoding(
             self._d_model, max_len=self._K, dropout=0.1
-        ).to(self._device)
-        self.action_queries = nn.Parameter(torch.randn(self._K, 1, self._d_model)).to(
-            self._device
         )
+        self.action_queries = nn.Parameter(torch.randn(self._K, 1, self._d_model))
 
         self._encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -112,7 +103,7 @@ class ACTModel(nn.Module):
                 dim_feedforward=dim_feedforward,
             ),
             num_encoder_layers,
-        ).to(self._device)
+        )
 
         self._decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
@@ -123,78 +114,21 @@ class ACTModel(nn.Module):
             ),
             num_decoder_layers,
             nn.LayerNorm(self._d_model),
-        ).to(self._device)
-
-        self._action_head = nn.Linear(self._d_model, self._action_space).to(
-            self._device
         )
 
-        self._optimizer = torch.optim.Adam(
-            list(self._encoder.parameters())
-            + list(self._decoder.parameters())
-            + list(self.z_projector.parameters())
-            + list(self.cvae_encoder.parameters())
-            + list(self._vision.parameters())
-            + list(self._action_head.parameters())
-            + list(self.pos_encoder.parameters())
-            + list(self._state_projector.parameters()),
-            lr=0.0000625,
-        )
-
-    def save_checkpoint(self, path: str) -> bool:
-        """Save model and optimizer state to `path`.
-
-        Returns True on success, False on failure.
-        """
-        parent = os.path.dirname(path)
-        if parent and not os.path.exists(parent):
-            os.makedirs(parent, exist_ok=True)
-
-        checkpoint = {
-            "model_state": self.state_dict(),
-        }
-        torch.save(checkpoint, path)
-        return True
-
-    def load_from_checkpoint(self, path: str) -> bool:
-        """Load model and optimizer state from `path`.
-
-        Returns True on success, False on failure.
-        """
-
-        # Load checkpoint with correct device mapping
-        checkpoint = torch.load(path, map_location=self._device)
-
-        # Load model weights
-        if "model_state" in checkpoint:
-            self.load_state_dict(checkpoint["model_state"])
-        return True
-
-    def select_action(
-        self, visual_features: torch.Tensor, state: torch.Tensor, num_samples: int = 1
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            if num_samples == 1:
-                actions = self.forward(visual_features, state, latent=None)
-                return actions.squeeze(0)
-            else:
-                # Sample multiple times and average
-                action_samples = []
-                for _ in range(num_samples):
-                    actions = self.forward(visual_features, state, latent=None)
-                    action_samples.append(actions)
-
-                return torch.stack(action_samples).mean(dim=0)
+        self._action_head = nn.Linear(self._d_model, self._action_space)
 
     def forward(
-        self, image: torch.Tensor, state: torch.Tensor, latent: Optional[torch.Tensor]
+        self, image: torch.Tensor, state: torch.Tensor, inference_latent: bool, actions: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         B, _, _, _ = image.shape
 
-        z = latent
-        if latent == None:
-            # provide empty encoder at inference time
-            z = torch.zeros(B, 32, device=self._device)
+        z = torch.zeros(B, 32, device=self._device)
+        z_mean = None
+        z_log = None
+        if inference_latent:
+            assert actions is not None, "Actions must be provided when inference_latent is True"
+            z, z_mean, z_log = self.cvae_encoder.forward(state, actions)
 
         z_proj = self.z_projector(z)
 
@@ -215,16 +149,44 @@ class ACTModel(nn.Module):
         decoder_output = self._decoder(
             action_queries, memory
         )  # (chunk_size, batch, hidden_dim)
-        action_output = self._action_head(decoder_output).squeeze(0).permute(1, 0, 2)
-        return action_output
+        predicted_action = self._action_head(decoder_output).squeeze(0).permute(1, 0, 2)
+        return predicted_action, z_mean, z_log
 
+
+class ACTModelWrapper(nn.Module):
+    def __init__(self, model: ACTModel, enhanced_debug: bool = True):
+        super().__init__()
+
+        self.B = 10
+
+        self._enhanced_debug : bool = enhanced_debug
+
+        self.model = model
+        self._optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=1e-4,
+        )
+
+    def select_action(
+        self, visual_features: torch.Tensor, state: torch.Tensor, num_samples: int = 1
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            if num_samples == 1:
+                actions, _, _ = self.forward(visual_features, state, inference_latent=False)
+                return actions.squeeze(0)
+            else:
+                # Sample multiple times and average
+                action_samples = []
+                for _ in range(num_samples):
+                    actions, _, _ = self.forward(visual_features, state, inference_latent=False)
+                    action_samples.append(actions)
+
+                return torch.stack(action_samples).mean(dim=0)
+            
     def train(
         self, image: torch.Tensor, state: torch.Tensor, actions: torch.Tensor
     ) -> Dict[str, float]:
-        # run auto-encoder
-        z, z_mean, z_log = self.cvae_encoder.forward(state, actions)
-        
-        action_output = self.forward(image, state, z)
+        action_output, z_mean, z_log = self.model(image, state, actions=actions, inference_latent=True)
 
         # optimize
         self._optimizer.zero_grad()
@@ -258,3 +220,21 @@ class ACTModel(nn.Module):
             "gt_action_histogram_x": np.asarray(gt_actions_x),
             "gt_action_histogram_y": np.asarray(gt_actions_y),
         }
+
+    def save_checkpoint(self, path: str) -> bool:
+        parent = os.path.dirname(path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+
+        checkpoint = {
+            "model_state": self.model.state_dict(),
+        }
+        torch.save(checkpoint, path)
+        return True
+
+    def load_from_checkpoint(self, path: str) -> bool:
+        checkpoint = torch.load(path, map_location=self._device)
+        if "model_state" in checkpoint:
+            self.model.load_state_dict(checkpoint["model_state"])
+        return True
+    

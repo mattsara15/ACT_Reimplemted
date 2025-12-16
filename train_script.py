@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # local imports
 from dataset import ACTDataLoader, ACTValDataLoader
-from model.act import ACTModel
+from model.act import ACTModel, ACTModelWrapper
 from model.temporal_ensemble_policy import TemporalEnsemblePolicy
 
 
@@ -171,7 +171,9 @@ def evaluate_model_on_demonstrations(
                 action_errors.append(action_error)
 
     return {
-        "mean_action_error": np.mean(action_errors)
+        "min_action_error": np.min(action_errors),
+        "mean_action_error": np.mean(action_errors),
+        "max_action_error": np.max(action_errors),
     }
 
 
@@ -213,13 +215,14 @@ def main():
             image_features_shape[2],
         )
 
-    model = ACTModel(
+    act = ACTModel(
         device=device,
         input_image_size=[input_features["observation.image"].shape],
         input_state_size=input_features["observation.state"].shape[0],
         action_space=output_features["action"].shape,
         K=args.k,
     )
+    model = ACTModelWrapper(act).to(device)
 
     act_dataset = ACTDataLoader(
         k=args.k,
@@ -264,6 +267,7 @@ def main():
 
             step_num += 1
 
+        # Evaluate the model
         eval_result = evaluate_model_on_demonstrations(model, val_dataloader, args)
 
         #eval_result = evaluate_model_in_gym(
@@ -274,8 +278,6 @@ def main():
                 logger.add_histogram(f"eval/{key}", value, step_num)
             else:
                 logger.add_scalar(f"eval/{key}", value, step_num)
-
-        # evaluate
         print(
             f"Completed epoch {epoch+1}/{args.epochs} with eval error: {eval_result['mean_action_error']}"
         )
